@@ -1,0 +1,718 @@
+---
+title: "GOmeth_by_feature_BcellvNK"
+output:
+  pdf_document: default
+  html_document: default
+date: "2022-12-06"
+---
+
+Adapted from: https://github.com/Oshlack/methyl-geneset-testing/blob/master/code/compare-methods/genRunMethodJob.R and https://github.com/Oshlack/methyl-geneset-testing/blob/master/analysis/05_compareMethods.Rmd
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(gridExtra)
+library(forcats)
+library(UpSetR)
+library(ComplexUpset)
+library(stringr) 
+
+
+setwd('/Users/clairedubin/bmi206/project')
+
+#from: https://github.com/Oshlack/methyl-geneset-testing/tree/master/code
+source("code/utility.R")
+```
+
+## Load data
+
+```{r}
+package <- "MissMethyl"
+set <- "GO"
+input <- "data/cache-intermediates/blood.contrasts.rds"
+outDir <- "GOmeth_by_feature/"
+arrayType <- "EPIC"
+
+obj <- readRDS(input)
+obj$tfit -> tfit
+obj$maxsize -> maxsize
+obj$minsize -> minsize
+obj$mVals -> mVals
+obj$targets -> targets
+
+
+ann <- loadAnnotation(arrayType=arrayType)
+collection <- missMethyl:::.getGO()$idList
+universe <- rownames(mVals)
+
+terms <- missMethyl:::.getGO()$idTable
+nGenes <- rownames_to_column(data.frame(n = sapply(missMethyl:::.getGO()$idList, 
+                                                   length)), 
+                             var = "ID")
+```
+
+
+"For input to GOmeth, we used either the statistically significant CpGs at FDR < 0.05 (CD4 vs CD8 T cells) or the top 5000 most highly ranked CpGs for comparisons with more than 5000 significant CpGs (B cells vs NK cells and monocytes vs neutrophils)."
+
+```{r}
+contList <- lapply(colnames(tfit$contrasts), function(coef){
+  tmp <- NULL
+  if(coef == "CD4vCD8") {
+    tmp$p1 <- rownames(limma::topTreat(tfit, coef = coef, p.value = 0.05, num = Inf))
+  } else {tmp$p1 <- rownames(limma::topTreat(tfit, coef = coef, num = 5000))
+}
+})
+names(contList) <- colnames(tfit$contrasts)
+
+```
+
+Run with various sets of genomic features:
+
+FEATURE OPTIONS: "ALL", "TSS200", "TSS1500", "Body", "1stExon", "3'UTR", "5'UTR",
+    "ExonBnd"
+    
+  TSS200: 0-200 bp upstream of transcription start site
+  TSS1500: 200-1500 bp upstream of transcription start site
+  Body: region between ATG start site and stop codon
+  1stExon: first exon of the gene
+  3'UTR: 3′ untranslated region that is between stop codon and poly-A tail
+  5'UTR: 5′ untranslated region located between the TSS and the ATG start site
+  ExonBnd: within 20 bases of an exon boundary, that is, the start or end of an exon
+  
+```{r}
+
+contrast_set = contList$BcellvNK
+contrast_name = "BcellvNK"
+
+features = c("ALL", "TSS200", "TSS1500", "Body", "1stExon", 
+             "3'UTR", "5'UTR","ExonBnd")
+
+feature_results = vector("list", length=length(features))
+  
+for (f in 1:length(features)){
+  
+  feature = features[f]
+
+  tmp <- vector("list", 2)
+  names(tmp) <- c("HGT", "GOmeth")
+  
+  tmp[[1]] <- tibble::rownames_to_column(missMethyl::topGSA(missMethyl::gsameth(
+                sig.cpg = contrast_set,
+                all.cpg = universe, collection = collection,
+                array.type = "EPIC", anno=ann, prior.prob = FALSE,
+                equiv.cpg = FALSE, genomic.features=feature), 
+                number = Inf), var = "ID")[, c("ID","P.DE")]
+  tmp[[1]]$feature = feature
+  
+  
+  tmp[[2]] <- tibble::rownames_to_column(missMethyl::topGSA(missMethyl::gsameth(
+                sig.cpg = contrast_set,
+                all.cpg = universe, collection = collection, fract.counts = TRUE,
+                array.type = "EPIC", anno=ann, prior.prob = TRUE,
+                equiv.cpg = TRUE, genomic.features=feature), 
+                number = Inf), var = "ID")[, c("ID","P.DE")]
+  tmp[[2]]$feature = feature
+
+  feature_results[[f]] = dplyr::bind_rows(tmp, .id = "method")
+  
+}
+
+dat = dplyr::bind_rows(feature_results)
+
+out <- "GOmeth_by_feature/GOmeth_by_feature_BcellvsNK_default_universe.rds"
+saveRDS(dat, out)
+
+
+```
+
+## Group by method and genomic feature, add GO information
+
+```{r}
+dat = readRDS("GOmeth_by_feature/GOmeth_by_feature_BcellvsNK_default_universe.rds")
+
+dat %>% arrange(feature, method, P.DE) %>%
+    group_by(method, feature) %>%
+    mutate(FDR = p.adjust(P.DE, method = "BH")) %>%
+    dplyr::filter(rank(FDR) <= 10)%>% 
+    inner_join(terms, by = c("ID" = "GOID")) %>%
+    inner_join(nGenes, by = c("ID" = "ID")) -> grouped_data
+
+```
+
+##Load truth sets
+
+```{r}
+immuneGO <- unique(read.csv("data/genesets/GO-immune-system-process.txt",
+                            stringsAsFactors = FALSE, header = FALSE,
+                            col.names = "GOID"))
+
+rnaseqGO <- readRDS("data/cache-rnaseq/RNAseq-GO.rds")
+rnaseqGO %>% group_by(contrast) %>%
+    mutate(rank = 1:n()) %>%
+    filter(rank <= 100) -> topGOSets
+
+
+rnaseqGO
+```
+
+##Plot top terms
+
+```{r}
+
+p <- vector("list", length(unique(grouped_data$feature)))
+truthPal <- scales::hue_pal()(4)
+names(truthPal) <- c("Both", "ISP", "Neither", "RNAseq")
+
+for(i in 1:length(p)){
+    feat <- sort(unique(grouped_data$feature))[i]
+
+    grouped_data %>% dplyr::filter(feature == feat) %>%
+    arrange(method, -rank(FDR)) %>%
+    ungroup() %>%
+    mutate(idx = as.factor(1:n())) -> tmp
+    
+    setLabs <- substr(tmp$TERM, 1, 40)
+    names(setLabs) <- tmp$idx
+    
+    tmp %>% mutate(rna = ID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name],
+                   isp = ID %in% immuneGO$GOID,
+                   both = rna + isp,
+                   col = ifelse(both == 2, "Both", 
+                                ifelse(both == 1 & rna == 1, "RNAseq",
+                                       ifelse(both == 1 & isp == 1, 
+                                              "ISP", "Neither")))) %>%
+        mutate(col = factor(col, 
+                            levels = c("Both", "ISP", "RNAseq", 
+                                       "Neither"))) -> tmp
+    
+    p[[i]] <- ggplot(tmp, aes(x = -log10(FDR), y = idx, colour = col)) +
+        geom_point(aes(size = n), alpha = 0.7) +
+        scale_size(limits = c(min(grouped_data$n), max(grouped_data$n))) +
+        facet_wrap(vars(method), ncol = 2, scales = "free") +
+        scale_y_discrete(labels = setLabs) +
+        scale_colour_manual(values = truthPal) + 
+      scale_color_manual(values=c('Both'="#F8766D",
+                                       'ISP'= "#7CAE00",
+                                       'Neither'="#C77CFF",
+                                       'RNAseq'="#00BFC4"
+                                       
+
+   ))
+        labs(y = "", size = "No. genes", colour = "In truth set") +
+        theme(axis.text.y = element_text(size = 8),
+              axis.text.x = element_text(size = 6),
+              legend.box = "vertical",
+              legend.margin = margin(0, 0, 0, 0, unit = "lines"),
+              panel.spacing.x = unit(1, "lines"),
+              aspect.ratio=2) +
+        coord_cartesian(xlim = c(-log10(0.99), -log10(10^-60))) +
+        geom_vline(xintercept = -log10(0.05), linetype = "dashed") +
+        ggtitle(feat)
+}
+
+
+p[[1]]
+p[[2]]
+p[[3]]
+p[[4]]
+p[[5]]
+p[[6]]
+p[[7]]
+```
+
+
+As above, but using CpGs in the specified genomic feature as the universe for testing.
+
+```{r}
+
+flat.u <- loadFlatAnnotation(ann)
+universe <- rownames(mVals)
+m_all <- match(flat.u$cpg, universe)
+flat.u = flat.u[!is.na(m_all),]
+
+contrast_set = contList$BcellvNK
+features = c("ALL", "TSS200", "TSS1500", "Body", "1stExon", 
+             "3'UTR", "5'UTR","ExonBnd")
+
+feature_results = vector("list", length=length(features))
+  
+
+for (f in 1:length(features)){
+  
+  feature = features[f]
+  print(feature)
+
+  tmp <- vector("list", 2)
+  names(tmp) <- c("HGT", "GOmeth")
+  
+  if (feature == "ALL"){ universe_by_feature = flat.u$cpg
+  } else {universe_by_feature = flat.u$cpg[flat.u$group %in% feature]
+  }
+   
+  
+  tmp[[1]] <- tibble::rownames_to_column(missMethyl::topGSA(missMethyl::gsameth(
+                sig.cpg = contrast_set,
+                all.cpg = universe_by_feature, collection = collection,
+                array.type = "EPIC", anno=ann, prior.prob = FALSE,
+                equiv.cpg = FALSE, genomic.features=feature), 
+                number = Inf), var = "ID")[, c("ID","P.DE")]
+  tmp[[1]]$feature = feature
+  
+  
+  tmp[[2]] <- tibble::rownames_to_column(missMethyl::topGSA(missMethyl::gsameth(
+                sig.cpg = contrast_set,
+                all.cpg = universe_by_feature, collection = collection, fract.counts = TRUE,
+                array.type = "EPIC", anno=ann, prior.prob = TRUE,
+                equiv.cpg = TRUE, genomic.features=feature), 
+                number = Inf), var = "ID")[, c("ID","P.DE")]
+  tmp[[2]]$feature = feature
+
+  feature_results[[f]] = dplyr::bind_rows(tmp, .id = "method")
+  
+}
+
+dat = dplyr::bind_rows(feature_results)
+
+out <- "GOmeth_by_feature/GOmeth_by_feature_BcellvsNK_universe_subset_by_feature.rds"
+saveRDS(dat, out)
+```
+
+```{r}
+
+dat = readRDS("GOmeth_by_feature/GOmeth_by_feature_BcellvsNK_universe_subset_by_feature.rds")
+
+dat %>% arrange(feature, method, P.DE) %>%
+    group_by(method, feature) %>%
+    mutate(FDR = p.adjust(P.DE, method = "BH")) %>%
+    dplyr::filter(rank(FDR) <= 10)%>% 
+    inner_join(terms, by = c("ID" = "GOID")) %>%
+    inner_join(nGenes, by = c("ID" = "ID")) -> grouped_data
+```
+
+
+```{r}
+p <- vector("list", length(unique(grouped_data$feature)))
+truthPal <- scales::hue_pal()(4)
+names(truthPal) <- c("Both", "ISP", "Neither", "RNAseq")
+
+
+for(i in 1:length(p)){
+    feat <- sort(unique(grouped_data$feature))[i]
+
+    grouped_data %>% dplyr::filter(feature == feat) %>%
+    arrange(method, -rank(FDR)) %>%
+    ungroup() %>%
+    mutate(idx = as.factor(1:n())) -> tmp
+    
+    setLabs <- substr(tmp$TERM, 1, 20)
+    names(setLabs) <- tmp$idx
+    
+    tmp %>% mutate(rna = ID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name],
+                   isp = ID %in% immuneGO$GOID,
+                   both = rna + isp,
+                   col = ifelse(both == 2, "Both", 
+                                ifelse(both == 1 & rna == 1, "RNAseq",
+                                       ifelse(both == 1 & isp == 1, 
+                                              "ISP", "Neither")))) %>%
+        mutate(col = factor(col, 
+                            levels = c("Both", "ISP", "RNAseq", 
+                                       "Neither"))) -> tmp
+    
+    p[[i]] <- ggplot(tmp, aes(x = -log10(FDR), y = idx, colour = col)) +
+        geom_point(aes(size = n), alpha = 0.7) +
+        scale_size(limits = c(min(grouped_data$n), max(grouped_data$n))) +
+        facet_wrap(vars(method), ncol = 2, scales = "free") +
+        scale_y_discrete(labels = setLabs) +
+        scale_color_manual(values=c('Both'="#F8766D",
+                                       'ISP'= "#7CAE00",
+                                       'Neither'="#C77CFF",
+                                       'RNAseq'="#00BFC4"
+                                       
+
+   )) +
+        labs(y = "", size = "No. genes", colour = "In truth set") +
+        theme(axis.text.y = element_text(size = 12),
+              axis.text.x = element_text(size = 12),
+              legend.box = "vertical",
+              legend.margin = margin(0, 0, 0, 0, unit = "lines"),
+              panel.spacing.x = unit(1, "lines"),
+              aspect.ratio=2) +
+        coord_cartesian(xlim = c(-log10(0.99), -log10(10^-60))) +
+        geom_vline(xintercept = -log10(0.05), linetype = "dashed") +
+        ggtitle(feat) 
+    
+    ggsave(paste("GOmeth_by_feature/BvNK_top_terms_", feat, ".png",  sep=""), plot =  p[[i]], )
+
+
+}
+
+
+p[[1]]
+p[[2]]
+p[[3]]
+p[[4]]
+p[[5]]
+p[[6]]
+
+
+
+```
+
+
+## What universe should I be using?
+
+Plot number of probes and genes in each subsetted universe.
+
+```{r}
+
+universe <- rownames(mVals)
+
+counts = vector("list", length=length(features))
+  
+for(i in 1:length(features)) {
+  
+  feature = features[[i]]
+  
+  if (feature == "ALL"){ 
+    universe_by_feature = flat.u$cpg
+    gene_universe_by_feature = flat.u$entrezid[flat.u$cpg %in% universe]
+    
+  } else {
+    
+  universe_by_feature = flat.u$cpg[flat.u$group %in% feature]
+  gene_universe_by_feature = flat.u$entrezid[flat.u$group %in% feature]
+  
+  }
+  
+  counts[[i]] = data.frame(length(universe_by_feature),
+                           length(unique(gene_universe_by_feature)))
+  row.names(counts[[i]]) = feature
+  names(counts[[i]]) = c("CpG_count", "Unique_gene_count")
+                                  
+}
+
+counts = dplyr::bind_rows(counts)
+
+counts = arrange(counts, desc(CpG_count))
+counts
+```
+
+```{r}
+ggplot(data=counts, aes(x = row.names(counts), y=CpG_count)) +
+  geom_bar(stat="identity") + 
+  aes(x = fct_reorder(row.names(counts), CpG_count, .desc = TRUE)) +
+  theme_classic() +
+  labs(title="Background probe counts by feature ",
+        x ="", y = "Probe Count")
+
+ggplot(data=counts, aes(x = row.names(counts), y=Unique_gene_count)) +
+  geom_bar(stat="identity") + 
+  aes(x = fct_reorder(row.names(counts), CpG_count, .desc = TRUE)) +
+  theme_classic() +
+  labs(title="Background gene set size by feature ",
+        x ="", y = "Unique Gene Count") +
+  theme(axis.text=element_text(size=12)) +
+  theme(axis.title=element_text(size=12))
+
+
+
+
+
+```
+##Going forward I will be using the universe subset by feature, not the default settings.
+
+
+##Upset plot for intersection of enriched GO terms
+
+```{r}
+
+dat = readRDS("GOmeth_by_feature/GOmeth_by_feature_BcellvsNK_universe_subset_by_feature.rds")
+
+
+dat_gometh = filter(dat, method == "GOmeth")
+dat_gometh %>% arrange(feature,P.DE) %>%
+    mutate(FDR = p.adjust(P.DE, method = "BH")) -> tmp
+
+gometh_sig_GO = filter(tmp, tmp$method=="GOmeth" & tmp$FDR < 0.05)
+
+sorted_features = rev(c("ALL", "TSS1500", "TSS200", "5'UTR", "1stExon" ,"Body"))
+sig_by_feature_list = vector("list", length(sorted_features))
+
+  
+
+for(i in 1:length(sorted_features)) {
+  
+  feat = sorted_features[[i]]
+  feature_sig = filter(gometh_sig_GO, gometh_sig_GO$feature==feat)
+  sig_by_feature_list[[i]] = c(feature_sig$ID)
+  print(feat)
+  print(length(feature_sig$ID))
+}
+
+names(sig_by_feature_list) = sorted_features
+upset_matrix = fromList(sig_by_feature_list)
+
+#throws an error when column starts with a number
+colnames(upset_matrix)[3] = "UTR_5"
+colnames(upset_matrix)[2] = "FirstExon"
+
+intersection_list = list(
+  list("ALL"), 
+  list("TSS1500"),
+  list("TSS200"),
+  list("UTR_5"),
+  list("Body"),
+  list("FirstExon"),
+  list("TSS1500","TSS200"),
+  list("TSS1500","UTR_5"),
+  list("TSS1500","TSS200", "UTR_5"),
+  list("Body", "FirstExon"),
+  list("ALL","TSS1500", "TSS200", "UTR_5", "Body", "FirstExon")
+)
+
+
+UpSetR::upset(upset_matrix, nsets = 6, order.by = c("degree", 
+    "freq"), mainbar.y.label = "Sig. GO Term Intersection Size")
+UpSetR::upset(upset_matrix, nsets = 6, intersections=intersection_list, 
+      mainbar.y.label = "Intersection Size of Significant GO Terms",
+      keep.order=TRUE)
+
+
+
+```
+## Terms unique to ALL
+
+```{r}
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[1]],sig_by_feature_list[[2]],
+           sig_by_feature_list[[3]],sig_by_feature_list[[4]],
+           sig_by_feature_list[[5]])
+
+unique_GO = sig_by_feature_list[[6]][!sig_by_feature_list[[6]] %in% others]
+
+t = filter(terms, terms$GOID %in% unique_GO)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+```
+
+
+
+## Terms unique to gene body
+
+```{r}
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[2]],sig_by_feature_list[[3]],
+           sig_by_feature_list[[4]],sig_by_feature_list[[5]],
+           sig_by_feature_list[[6]])
+
+unique_GO = sig_by_feature_list$Body[!sig_by_feature_list$Body %in% others]
+
+
+t = filter(terms, terms$GOID %in% unique_GO)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+```
+
+##Terms unique to first exon:
+
+```{r}
+
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[1]],sig_by_feature_list[[3]],
+           sig_by_feature_list[[4]],sig_by_feature_list[[5]],
+           sig_by_feature_list[[6]])
+
+unique_GO = sig_by_feature_list[[2]][!sig_by_feature_list[[2]] %in% others]
+
+t = filter(terms, terms$GOID %in% unique_GO)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+```
+
+##Terms unique to TSS1500
+
+```{r}
+
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[1]],sig_by_feature_list[[2]],
+           sig_by_feature_list[[3]],sig_by_feature_list[[4]],
+           sig_by_feature_list[[6]])
+
+unique_GO = sig_by_feature_list[[5]][!sig_by_feature_list[[5]] %in% others]
+
+t = filter(terms, terms$GOID %in% unique_GO)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+```
+##Terms unique to TSS200
+
+```{r}
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[1]],sig_by_feature_list[[2]],
+           sig_by_feature_list[[3]],sig_by_feature_list[[5]],
+           sig_by_feature_list[[6]])
+
+unique_GO = sig_by_feature_list[[4]][!sig_by_feature_list[[4]] %in% others]
+
+t = filter(terms, terms$GOID %in% unique_GO)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+```
+
+
+
+##Terms in all feature sets
+
+```{r}
+names(sig_by_feature_list)
+
+others = c(sig_by_feature_list[[1]],sig_by_feature_list[[2]],
+           sig_by_feature_list[[3]],sig_by_feature_list[[4]],
+           sig_by_feature_list[[5]],sig_by_feature_list[[6]])
+
+t = as.data.frame(table(others))
+
+t = filter(terms, terms$GOID %in% filter(t, t$Freq==6)$others)
+t$inTruthSet = (t$GOID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name] |
+  t$GOID %in% immuneGO$GOID)
+
+t
+
+```
+
+
+```{r}
+x <- vector("list", length(sig_by_feature_list))
+truthPal <- scales::hue_pal()(4)
+names(truthPal) <- c("Both", "ISP", "Neither", "RNAseq")
+
+for(i in 1:length(x)){
+feat = names(sig_by_feature_list)[i]
+sig_GO = data.frame(sig_by_feature_list[[i]])
+colnames(sig_GO) = "ID"
+sig_GO %>% mutate(rna = ID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name],
+                   isp = ID %in% immuneGO$GOID,
+                   both = rna + isp,
+                   col = ifelse(both == 2, "Both", 
+                                ifelse(both == 1 & rna == 1, "RNAseq",
+                                       ifelse(both == 1 & isp == 1, 
+                                              "ISP", "Neither")))) %>%
+        mutate(col = factor(col, 
+                            levels = c("Both", "ISP", "RNAseq", 
+                                       "Neither"))) -> tmp
+
+x[[i]] = tmp
+}
+
+names(x) = names(sig_by_feature_list)
+combined = bind_rows(x, .id = "feature")
+
+ggplot(combined, aes(fill=col, x=reorder(feature,feature,
+                     function(x)-length(x)))) + 
+    geom_bar(position="stack") + 
+  scale_fill_manual(values=scales::hue_pal()(4)) +
+    guides(fill = guide_legend(title = "In truth set(s)"))+
+    labs(y = "significant GO term count", x="")  + theme_classic()
+
+```
+
+```{r}
+#fromList that keeps row names
+#source: https://github.com/hms-dbmi/UpSetR/issues/85
+
+fromList <- function (input) {
+  # Same as original fromList()...
+  elements <- unique(unlist(input))
+  data <- unlist(lapply(input, function(x) {
+      x <- as.vector(match(elements, x))
+      }))
+  data[is.na(data)] <- as.integer(0)
+  data[data != 0] <- as.integer(1)
+  data <- data.frame(matrix(data, ncol = length(input), byrow = F))
+  data <- data[which(rowSums(data) != 0), ]
+  names(data) <- names(input)
+  # ... Except now it conserves your original value names!
+  row.names(data) <- elements
+  return(data)
+  }
+
+upset_matrix = fromList(sig_by_feature_list)
+upset_matrix<- tibble::rownames_to_column(upset_matrix, "ID")
+upset_matrix
+
+upset_matrix %>% mutate(rna = ID %in% topGOSets$ID[topGOSets$contrast %in% contrast_name],
+                   isp = ID %in% immuneGO$GOID,
+                   both = rna + isp,
+                   col = ifelse(both == 2, "Both", 
+                                ifelse(both == 1 & rna == 1, "RNAseq",
+                                       ifelse(both == 1 & isp == 1, 
+                                              "ISP", "Neither")))) %>%
+        mutate(col = factor(col, 
+                            levels = c("Both", "ISP", "RNAseq", 
+                                       "Neither"))) -> tmp
+
+intersection_list = list(
+  c("ALL"), 
+  c("TSS1500"),
+  c("TSS200"),
+  c("5'UTR"),
+  c("1stExon"),
+  c("Body"),
+  c("TSS1500","TSS200"),
+  c("TSS1500","5'UTR"),
+  c("TSS1500","TSS200", "5'UTR"),
+  c("Body", "1stExon"),
+  c("ALL","TSS1500", "TSS200", "5'UTR", "Body", "1stExon")
+)
+
+ComplexUpset::upset(
+    tmp,
+    names(sig_by_feature_list),
+    base_annotations=list(
+        'Intersection size'=intersection_size(
+            counts=FALSE,
+            mapping=aes(fill=col)
+        ) + scale_fill_manual(values=c('Both'="#F8766D",
+                                       'ISP'= "#7CAE00",
+                                       'Neither'="#C77CFF",
+                                       'RNAseq'="#00BFC4"
+                                       
+
+   ))
+    ),
+     name='',
+    width_ratio=0.3, sort_sets=FALSE, height_ratio=0.4,
+    intersections = intersection_list, sort_intersections = FALSE,
+    set_sizes=(
+             upset_set_size(
+            geom=geom_bar(aes(fill=col, x=group),
+                          width=0.8, )
+            
+            )),
+        guides='collect'
+
+            
+) 
+
+
+
+```
+
